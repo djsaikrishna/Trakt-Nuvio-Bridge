@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Nuvio Trakt Bridge</title>
+    <meta name="description" content="Sync Trakt watched history and continue watching progress into Nuvio Sync.">
+    <link rel="preconnect" href="https://nuvioapp.space">
+    <link rel="preconnect" href="https://trakt.tv">
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="#top" aria-label="Nuvio Trakt Bridge home">
+          <span class="brand__logos" aria-hidden="true">
+            <img src="https://nuvioapp.space/assets/Logo_1080x1080.png" alt="">
+            <img class="trakt-logo" src="./assets/trakt-logomark.svg" alt="">
+          </span>
+          <span>
+            <strong>Nuvio Trakt Bridge</strong>
+            <small>Local Trakt to Nuvio sync</small>
+          </span>
+        </a>
+        <div class="topbar__status" aria-live="polite">
+          <span id="trakt-status" class="status-pill">Trakt disconnected</span>
+          <span id="nuvio-status" class="status-pill">Nuvio disconnected</span>
+        </div>
+      </header>
+
+      <main id="top" class="workspace-grid">
+        <aside class="panel account-panel">
+          <div class="panel__header">
+            <div>
+              <p class="eyebrow">Accounts</p>
+              <h1>Connect</h1>
+            </div>
+          </div>
+
+          <div class="connector" id="trakt-card">
+            <div class="connector__title">
+              <img class="trakt-logo" src="./assets/trakt-logomark.svg" alt="">
+              <div>
+                <h2>Trakt</h2>
+                <p>Official OAuth sign in</p>
+              </div>
+            </div>
+
+            <div class="button-row">
+              <button id="start-trakt-login" class="button button--primary" type="button">Connect Trakt</button>
+              <button id="logout-trakt" class="button button--ghost" type="button">Disconnect</button>
+            </div>
+          </div>
+
+          <div class="connector" id="nuvio-card">
+            <div class="connector__title">
+              <img src="https://nuvioapp.space/assets/Logo_1080x1080.png" alt="">
+              <div>
+                <h2>Nuvio Sync</h2>
+                <p>Account and profile</p>
+              </div>
+            </div>
+
+            <label>
+              Email
+              <input id="nuvio-email" type="email" autocomplete="off" placeholder="you@example.com">
+            </label>
+            <label>
+              Password
+              <input id="nuvio-password" type="password" autocomplete="off" placeholder="Your Nuvio password">
+            </label>
+
+            <div class="button-row">
+              <button id="login-nuvio" class="button button--primary" type="button">Sign In</button>
+              <button id="logout-nuvio" class="button button--ghost" type="button">Disconnect</button>
+            </div>
+
+            <label>
+              Nuvio profile
+              <select id="profile-select">
+                <option value="1">Profile 1</option>
+              </select>
+            </label>
+          </div>
+        </aside>
+
+        <section class="main-stack">
+          <section class="panel sync-panel">
+            <div class="panel__header">
+              <div>
+                <p class="eyebrow">Sync</p>
+                <h2>Import from Trakt</h2>
+              </div>
+            </div>
+
+            <div class="option-grid">
+              <label class="option-card">
+                <input id="sync-history" type="checkbox" checked>
+                <span>
+                  <strong>Watched history</strong>
+                  <small>Movies and watched episodes</small>
+                </span>
+              </label>
+              <label class="option-card">
+                <input id="sync-progress" type="checkbox" checked>
+                <span>
+                  <strong>Continue watching</strong>
+                  <small>Playback progress</small>
+                </span>
+              </label>
+            </div>
+
+            <details class="compact-details">
+              <summary>Library imports</summary>
+              <div class="option-grid option-grid--compact">
+                <label class="option-card">
+                  <input id="sync-watchlist" type="checkbox">
+                  <span>
+                    <strong>Watchlist</strong>
+                    <small>Save Trakt watchlist items to Nuvio library</small>
+                  </span>
+                </label>
+                <label class="option-card">
+                  <input id="sync-collection" type="checkbox">
+                  <span>
+                    <strong>Collection</strong>
+                    <small>Save Trakt collection items to Nuvio library</small>
+                  </span>
+                </label>
+              </div>
+            </details>
+
+            <div class="button-row button-row--large">
+              <button id="preview-sync" class="button button--secondary" type="button">Preview</button>
+              <button id="run-sync" class="button button--primary" type="button">Sync to Nuvio</button>
+            </div>
+          </section>
+
+          <section class="metrics-bar" aria-live="polite">
+            <article class="metric-item">
+              <span>Watched</span>
+              <strong id="stat-history">0</strong>
+            </article>
+            <article class="metric-item">
+              <span>Progress</span>
+              <strong id="stat-progress">0</strong>
+            </article>
+            <article class="metric-item">
+              <span>Library</span>
+              <strong id="stat-library">0</strong>
+            </article>
+            <article class="metric-item">
+              <span>Skipped</span>
+              <strong id="stat-skipped">0</strong>
+            </article>
+          </section>
+
+          <section class="panel results-panel">
+            <div class="panel__header">
+              <div>
+                <p class="eyebrow">Activity</p>
+                <h2>Results</h2>
+              </div>
+              <div class="results-actions">
+                <div id="preview-pager" class="preview-pager" hidden>
+                  <button id="preview-prev" class="pager-button" type="button">Previous</button>
+                  <span id="preview-page-info">Page 1 of 1</span>
+                  <button id="preview-next" class="pager-button" type="button">Next</button>
+                </div>
+                <button id="copy-log" class="button button--ghost" type="button">Copy Log</button>
+              </div>
+            </div>
+            <div id="log" class="log" role="log" aria-live="polite"></div>
+            <div class="preview-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Type</th>
+                    <th>Title</th>
+                    <th>Nuvio ID</th>
+                    <th>When</th>
+                  </tr>
+                </thead>
+                <tbody id="preview-table">
+                  <tr>
+                    <td colspan="4">Pull data to preview mapped items.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <template id="toast-template">
+      <div class="toast" role="status"></div>
+    </template>
+    <div id="toasts" class="toasts" aria-live="polite"></div>
+
+    <script src="./config.js"></script>
+    <script src="./app.js" defer></script>
+  </body>
+</html>
