@@ -49,6 +49,9 @@ let pendingTraktState = null;
 let pendingTraktClientId = "";
 let traktBroadcastChannel = null;
 const PREVIEW_PAGE_SIZE = 50;
+const EPISODE_REMAP_META_TIMEOUT_MS = 1500;
+const EPISODE_REMAP_TRAKT_TIMEOUT_MS = 2500;
+const EPISODE_REMAP_TOTAL_BUDGET_MS = 15000;
 let episodeMappingContextPromise = null;
 let episodeMappingContextKey = "";
 const addonManifestCache = new Map();
@@ -581,7 +584,7 @@ async function refreshTraktToken(refreshToken) {
   return data;
 }
 
-async function traktRequest(path, params = {}) {
+async function traktRequest(path, params = {}, fetchOptions = {}) {
   const accessToken = await ensureTraktAccessToken();
   const apiKey = normalizeTraktClientId(state.trakt.clientId);
   if (!apiKey) {
@@ -595,13 +598,25 @@ async function traktRequest(path, params = {}) {
   });
 
   return requestJson(url.toString(), {
+    ...fetchOptions,
     headers: {
       "Content-Type": "application/json",
       "trakt-api-version": "2",
       "trakt-api-key": apiKey,
       Authorization: `Bearer ${accessToken}`,
+      ...(fetchOptions.headers || {}),
     },
   });
+}
+
+async function traktRequestWithTimeout(path, params = {}, timeoutMs = 2500) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await traktRequest(path, params, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function loginNuvio() {
@@ -818,6 +833,14 @@ async function prepareEpisodeMapper() {
       logLine("No compatible Nuvio metadata addon was found, so episode remapping is skipped.");
       return null;
     }
+    context.disabled = false;
+    context.startedAt = 0;
+    context.timeoutLogged = false;
+    context.metaTimeoutMs = EPISODE_REMAP_META_TIMEOUT_MS;
+    context.traktTimeoutMs = EPISODE_REMAP_TRAKT_TIMEOUT_MS;
+    context.totalBudgetMs = EPISODE_REMAP_TOTAL_BUDGET_MS;
+    context.fallbackStats = {};
+    context.fallbackLogCounts = {};
     logLine(`Using Nuvio metadata addon for episode remapping: ${context.addons[0].name}.`);
     return context;
   } catch (error) {
@@ -1022,7 +1045,7 @@ async function fetchMetaFromAddons(context, type, id) {
     if (addonMetaCache.has(cacheKey)) {
       response = addonMetaCache.get(cacheKey);
     } else {
-      response = await fetchJsonUrl(buildAddonMetaUrl(addon.baseUrl, candidateType, id), 8000)
+      response = await fetchJsonUrl(buildAddonMetaUrl(addon.baseUrl, candidateType, id), context.metaTimeoutMs || EPISODE_REMAP_META_TIMEOUT_MS)
         .catch(() => null);
       addonMetaCache.set(cacheKey, response);
     }
@@ -1056,6 +1079,13 @@ async function getAddonEpisodes(contentId, contentType, context) {
   const meta = await fetchSeriesMeta(contentId, contentType, context);
   const episodes = mapAddonVideosToEpisodeEntries(meta?.videos || []);
   addonEpisodeCache.set(cacheKey, episodes);
+  if (!episodes.length) {
+    noteEpisodeRemapFallback(
+      context,
+      "metadata",
+      `addon metadata was unavailable or timed out for ${contentId}; using Trakt numbering for that show.`,
+    );
+  }
   return episodes;
 }
 
@@ -1081,12 +1111,24 @@ function mapAddonVideosToEpisodeEntries(videos) {
     .sort(compareEpisodeEntries);
 }
 
-async function getTraktEpisodes(showLookupId) {
+async function getTraktEpisodes(showLookupId, context) {
   if (!showLookupId) return [];
   if (traktEpisodeCache.has(showLookupId)) return traktEpisodeCache.get(showLookupId);
-  const { data } = await traktRequest(`/shows/${encodeURIComponent(showLookupId)}/seasons`, {
-    extended: "episodes",
-  });
+  let data = [];
+  try {
+    const response = await traktRequestWithTimeout(`/shows/${encodeURIComponent(showLookupId)}/seasons`, {
+      extended: "episodes",
+    }, context?.traktTimeoutMs || EPISODE_REMAP_TRAKT_TIMEOUT_MS);
+    data = response.data;
+  } catch {
+    noteEpisodeRemapFallback(
+      context,
+      "trakt",
+      `Trakt episode lookup was unavailable or timed out for ${showLookupId}; using Trakt numbering for that show.`,
+    );
+    traktEpisodeCache.set(showLookupId, []);
+    return [];
+  }
   const entries = [];
   for (const season of Array.isArray(data) ? data : []) {
     const seasonNumber = asNumber(season?.number);
@@ -1109,6 +1151,7 @@ async function getTraktEpisodes(showLookupId) {
 
 async function resolveImportedEpisodeMapping(context, params) {
   if (!context?.addons?.length) return null;
+  if (!episodeMapperCanContinue(context)) return null;
   const cacheKey = [
     context.effectiveProfileId,
     params.contentType,
@@ -1122,12 +1165,16 @@ async function resolveImportedEpisodeMapping(context, params) {
   let mapped = null;
   try {
     const addonEpisodes = await getAddonEpisodes(params.contentId, params.contentType, context);
+    if (!episodeMapperCanContinue(context)) return null;
     const showLookupId = resolveShowLookupId(params.show?.ids, params.contentId);
-    const traktEpisodes = await getTraktEpisodes(showLookupId);
+    const traktEpisodes = await getTraktEpisodes(showLookupId, context);
+    if (!episodeMapperCanContinue(context)) return null;
 
+    let triedRemap = false;
     if (addonEpisodes.length && traktEpisodes.length) {
       const addonHasEpisode = addonEpisodes.some((item) => item.season === params.season && item.episode === params.episode);
       if (!(addonHasEpisode && hasSameSeasonStructure(addonEpisodes, traktEpisodes))) {
+        triedRemap = true;
         mapped = reverseRemapEpisodeByTitleOrIndex({
           requestedSeason: params.season,
           requestedEpisode: params.episode,
@@ -1137,12 +1184,73 @@ async function resolveImportedEpisodeMapping(context, params) {
         });
       }
     }
+    if (triedRemap && !mapped) {
+      noteEpisodeRemapFallback(
+        context,
+        "unmapped",
+        `no confident remap for ${params.show?.title || params.contentId} S${pad2(params.season)}E${pad2(params.episode)}; using Trakt numbering.`,
+      );
+    }
   } catch {
+    noteEpisodeRemapFallback(
+      context,
+      "error",
+      `unexpected remap error for ${params.show?.title || params.contentId} S${pad2(params.season)}E${pad2(params.episode)}; using Trakt numbering.`,
+    );
     mapped = null;
   }
 
   episodeMappingCache.set(cacheKey, mapped);
   return mapped;
+}
+
+function noteEpisodeRemapFallback(context, type, message) {
+  if (!context) return;
+  context.fallbackStats ||= {};
+  context.fallbackLogCounts ||= {};
+  context.fallbackStats[type] = (context.fallbackStats[type] || 0) + 1;
+  context.fallbackLogCounts[type] = (context.fallbackLogCounts[type] || 0) + 1;
+
+  const count = context.fallbackLogCounts[type];
+  if (count <= 5) {
+    logLine(`Episode remapping fallback: ${message}`);
+  } else if (count === 6) {
+    logLine(`Episode remapping fallback: more ${type} fallbacks occurred; summary will be shown at the end.`);
+  }
+}
+
+function logEpisodeRemapFallbackSummary(context) {
+  const stats = context?.fallbackStats || {};
+  const total = Object.values(stats).reduce((sum, value) => sum + Number(value || 0), 0);
+  if (!total) return;
+  const parts = [
+    ["metadata", "addon metadata unavailable"],
+    ["trakt", "Trakt episode lookup unavailable"],
+    ["unmapped", "no confident remap"],
+    ["error", "remap errors"],
+    ["budget", "remapping time budget exceeded"],
+  ]
+    .filter(([key]) => stats[key])
+    .map(([key, label]) => `${stats[key]} ${label}`);
+  logLine(`Episode remapping fallback summary: ${parts.join(", ")}. Affected items used original Trakt numbering.`);
+}
+
+function episodeMapperCanContinue(context) {
+  if (!context || context.disabled) return false;
+  if (!context.startedAt) {
+    context.startedAt = Date.now();
+    return true;
+  }
+  const budgetMs = context.totalBudgetMs || EPISODE_REMAP_TOTAL_BUDGET_MS;
+  if (Date.now() - context.startedAt <= budgetMs) return true;
+  context.disabled = true;
+  if (!context.timeoutLogged) {
+    context.timeoutLogged = true;
+    context.fallbackStats ||= {};
+    context.fallbackStats.budget = (context.fallbackStats.budget || 0) + 1;
+    logLine("Episode remapping is taking too long. Continuing this sync without remapping the remaining episodes.");
+  }
+  return false;
 }
 
 function reverseRemapEpisodeByTitleOrIndex({
@@ -1354,6 +1462,7 @@ async function pullTraktPlan(options) {
   if (plan.remappedEpisodes) {
     logLine(`Remapped ${plan.remappedEpisodes} episode entries with Nuvio addon episode order.`);
   }
+  logEpisodeRemapFallbackSummary(episodeMapper);
 
   return plan;
 }
